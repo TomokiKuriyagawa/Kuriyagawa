@@ -1,0 +1,1451 @@
+using Microsoft.Azure.Kinect.BodyTracking;
+using Microsoft.Azure.Kinect.Sensor;
+using System;
+using OpenGL;
+using OpenGL.CoreUI;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Threading.Tasks;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Drawing;
+using Image = Microsoft.Azure.Kinect.Sensor.Image;
+
+namespace Csharp_3d_viewer
+
+{
+
+    class Program
+
+    {
+
+        static void Main()
+
+        {
+
+            using (var visualizerData = new VisualizerData())
+
+            {
+
+                var renderer = new Renderer(visualizerData);
+
+
+
+                renderer.StartVisualizationThread();
+
+
+
+                // Open device.
+
+                using (Device device = Device.Open())
+
+                {
+
+                    device.StartCameras(new DeviceConfiguration()
+
+                    {
+
+                        CameraFPS = FPS.FPS30,
+
+                        ColorResolution = ColorResolution.Off,
+
+                        DepthMode = DepthMode.NFOV_Unbinned,
+
+                        WiredSyncMode = WiredSyncMode.Standalone,
+
+                    });
+
+
+
+                    var deviceCalibration = device.GetCalibration();
+
+                    PointCloud.ComputePointCloudCache(deviceCalibration);
+
+
+
+                    using (Tracker tracker = Tracker.Create(deviceCalibration, new TrackerConfiguration() { ProcessingMode = TrackerProcessingMode.Gpu, SensorOrientation = SensorOrientation.Default }))
+
+                    {
+
+                        while (renderer.IsActive)
+
+                        {
+
+                            using (Capture sensorCapture = device.GetCapture())
+
+                            {
+
+                                // Queue latest frame from the sensor.
+
+                                tracker.EnqueueCapture(sensorCapture);
+
+                            }
+
+
+
+                            // Try getting latest tracker frame.
+
+                            using (Frame frame = tracker.PopResult(TimeSpan.Zero, throwOnTimeout: false))
+
+                            {
+
+                                if (frame != null)
+
+                                {
+
+                                    // Save this frame for visualization in Renderer.
+
+
+
+                                    // One can access frame data here and extract e.g. tracked bodies from it for the needed purpose.
+
+                                    // Instead, for simplicity, we transfer the frame object to the rendering background thread.
+
+                                    // This example shows that frame popped from tracker should be disposed. Since here it is used
+
+                                    // in a different thread, we use Reference method to prolong the lifetime of the frame object.
+
+                                    // For reference on how to read frame data, please take a look at Renderer.NativeWindow_Render().
+
+                                    visualizerData.Frame = frame.Reference();
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        }
+
+        public class VisualizerData : IDisposable
+
+        {
+
+            private Frame frame;
+
+
+
+            public Frame Frame
+
+            {
+
+                set
+
+                {
+
+                    lock (this)
+
+                    {
+
+                        frame?.Dispose();
+
+                        frame = value;
+
+                    }
+
+                }
+
+            }
+
+
+
+            public Frame TakeFrameWithOwnership()
+
+            {
+
+                lock (this)
+
+                {
+
+                    var result = frame;
+
+                    frame = null;
+
+                    return result;
+
+                }
+
+            }
+
+
+
+            public void Dispose()
+
+            {
+
+                lock (this)
+
+                {
+
+                    frame?.Dispose();
+
+                    frame = null;
+
+                }
+
+            }
+
+        }
+
+        public class Renderer
+
+        {
+
+            private SphereRenderer SphereRenderer;
+
+            private CylinderRenderer CylinderRenderer;
+
+            private PointCloudRenderer PointCloudRenderer;
+
+
+
+            private readonly VisualizerData visualizerData;
+
+            private List<Vertex> pointCloud = null;
+
+
+
+            public Renderer(VisualizerData visualizerData)
+
+            {
+
+                this.visualizerData = visualizerData;
+
+            }
+
+
+
+            public bool IsActive { get; private set; }
+
+
+
+            public void StartVisualizationThread()
+
+            {
+
+                Task.Run(() =>
+
+                {
+
+                    using (NativeWindow nativeWindow = NativeWindow.Create())
+
+                    {
+
+                        IsActive = true;
+
+                        nativeWindow.ContextCreated += NativeWindow_ContextCreated;
+
+                        nativeWindow.Render += NativeWindow_Render;
+
+                        nativeWindow.KeyDown += (object obj, NativeWindowKeyEventArgs e) =>
+
+                        {
+
+                            switch (e.Key)
+
+                            {
+
+                                case KeyCode.Escape:
+
+                                    nativeWindow.Stop();
+
+                                    IsActive = false;
+
+                                    break;
+
+
+
+                                case KeyCode.F:
+
+                                    nativeWindow.Fullscreen = !nativeWindow.Fullscreen;
+
+                                    break;
+
+                            }
+
+                        };
+
+                        nativeWindow.Animation = true;
+
+
+
+                        nativeWindow.Create(0, 0, 1366, 768, NativeWindowStyle.Overlapped);
+
+
+
+                        nativeWindow.Show();
+
+                        nativeWindow.Run();
+
+                    }
+
+                });
+
+            }
+
+
+
+            private void NativeWindow_ContextCreated(object sender, NativeWindowEventArgs e)
+
+            {
+
+                Gl.ReadBuffer(ReadBufferMode.Back);
+
+
+
+                Gl.ClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+
+
+
+                Gl.Enable(EnableCap.Blend);
+
+                Gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+
+
+
+                Gl.LineWidth(2.5f);
+
+
+
+                CreateResources();
+
+            }
+
+
+
+            private static float ToRadians(float degrees)
+
+            {
+
+                return degrees / 180.0f * (float)Math.PI;
+
+            }
+
+
+
+            private void NativeWindow_Render(object sender, NativeWindowEventArgs e)
+
+            {
+
+                using (var lastFrame = visualizerData.TakeFrameWithOwnership())
+
+                {
+
+                    if (lastFrame == null)
+
+                    {
+
+                        return;
+
+                    }
+
+
+
+                    NativeWindow nativeWindow = (NativeWindow)sender;
+
+
+
+                    Gl.Viewport(0, 0, (int)nativeWindow.Width, (int)nativeWindow.Height);
+
+                    Gl.Clear(ClearBufferMask.ColorBufferBit);
+
+
+
+                    // Update model/view/projective matrices in shader
+
+                    var proj = Matrix4x4.CreatePerspectiveFieldOfView(ToRadians(65.0f), (float)nativeWindow.Width / nativeWindow.Height, 0.1f, 150.0f);
+
+                    var view = Matrix4x4.CreateLookAt(Vector3.Zero, Vector3.UnitZ, -Vector3.UnitY);
+
+
+
+                    SphereRenderer.View = view;
+
+                    SphereRenderer.Projection = proj;
+
+
+
+                    CylinderRenderer.View = view;
+
+                    CylinderRenderer.Projection = proj;
+
+
+
+                    PointCloudRenderer.View = view;
+
+                    PointCloudRenderer.Projection = proj;
+
+
+
+                    PointCloud.ComputePointCloud(lastFrame.Capture.Depth, ref pointCloud);
+
+                    PointCloudRenderer.Render(pointCloud, new Vector4(1, 1, 1, 1));
+
+
+
+                    for (uint i = 0; i < lastFrame.NumberOfBodies; ++i)
+
+                    {
+
+                        var skeleton = lastFrame.GetBodySkeleton(i);
+
+                        var bodyId = lastFrame.GetBodyId(i);
+
+                        var bodyColor = BodyColors.GetColorAsVector(bodyId);
+
+
+
+                        for (int jointId = 0; jointId < (int)JointId.Count; ++jointId)
+
+                        {
+
+                            var joint = skeleton.GetJoint(jointId);
+
+
+
+                            // Render the joint as a sphere.
+
+                            const float radius = 0.024f;
+
+                            SphereRenderer.Render(joint.Position / 1000, radius, bodyColor);
+
+
+
+                            if (JointConnections.JointParent.TryGetValue((JointId)jointId, out JointId parentId))
+
+                            {
+
+                                // Render a bone connecting this joint and its parent as a cylinder.
+
+                                CylinderRenderer.Render(joint.Position / 1000, skeleton.GetJoint((int)parentId).Position / 1000, bodyColor);
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+
+
+            private void CreateResources()
+
+            {
+
+                SphereRenderer = new SphereRenderer();
+
+                CylinderRenderer = new CylinderRenderer();
+
+                PointCloudRenderer = new PointCloudRenderer();
+
+            }
+
+        }
+
+        public class SphereRenderer : TriangleRenderer
+
+        {
+
+            private const float radius = 1.0f;
+
+            private const int MinSectorCount = 3;
+
+            private const int MinStackCount = 2;
+
+
+
+            public SphereRenderer(int sectorCount = 36, int stackCount = 18)
+
+            {
+
+                sectorCount = Math.Max(sectorCount, MinSectorCount);
+
+                stackCount = Math.Max(stackCount, MinStackCount);
+
+
+
+                BuildVertices(sectorCount, stackCount, out var vertices, out var indices);
+
+                UpdateTriangles(vertices, indices);
+
+            }
+
+
+
+            public void Render(Vector3 position, float radius, Vector4 color)
+
+            {
+
+                var model = Matrix4x4.CreateScale(radius) * Matrix4x4.CreateTranslation(position);
+
+                Render(model, color);
+
+            }
+
+
+
+            private void BuildVertices(int sectorCount, int stackCount, out Vertex[] vertices, out int[] indices)
+
+            {
+
+                var radiusInv = 1.0f / radius;
+
+                var sectorStep = (float)(2 * Math.PI / sectorCount);
+
+                var stackStep = Math.PI / stackCount;
+
+
+
+                var sphereVertices = new List<Vertex>();
+
+                for (int i = 0; i <= stackCount; ++i)
+
+                {
+
+                    Vector3 position = new Vector3();
+
+                    var stackAngle = (float)(Math.PI / 2 - i * stackStep);
+
+                    var xy = radius * Math.Cos(stackAngle);
+
+                    position.Z = (float)(radius * Math.Sin(stackAngle));
+
+
+
+                    for (int j = 0; j <= sectorCount; ++j)
+
+                    {
+
+                        var sectorAngle = j * sectorStep;
+
+
+
+                        position.X = (float)(xy * Math.Cos(sectorAngle));
+
+                        position.Y = (float)(xy * Math.Sin(sectorAngle));
+
+
+
+                        Vector3 normal = new Vector3(position.X, position.Y, position.Z) * radiusInv;
+
+
+
+                        sphereVertices.Add(new Vertex { Position = position, Normal = normal });
+
+                    }
+
+                }
+
+
+
+                vertices = sphereVertices.ToArray();
+
+
+
+                var sphereIndices = new List<int>();
+
+                for (int i = 0; i < stackCount; ++i)
+
+                {
+
+                    var k1 = i * (sectorCount + 1);
+
+                    var k2 = k1 + sectorCount + 1;
+
+
+
+                    for (int j = 0; j < sectorCount; ++j, ++k1, ++k2)
+
+                    {
+
+                        if (i != 0)
+
+                        {
+
+                            sphereIndices.Add(k1);
+
+                            sphereIndices.Add(k2);
+
+                            sphereIndices.Add(k1 + 1);
+
+                        }
+
+                        if (i != (stackCount - 1))
+
+                        {
+
+                            sphereIndices.Add(k1 + 1);
+
+                            sphereIndices.Add(k2);
+
+                            sphereIndices.Add(k2 + 1);
+
+                        }
+
+                    }
+
+                }
+
+                indices = sphereIndices.ToArray();
+
+            }
+
+        }
+
+        public class CylinderRenderer : TriangleRenderer
+
+        {
+
+            private const float baseRadius = 1.0f;
+
+            private const float height = 1.0f;
+
+            private const float baseScale = 0.01f;
+
+            private const int MinSectorCount = 3;
+
+
+
+            public CylinderRenderer(int sectorCount = 36)
+
+            {
+
+                sectorCount = Math.Max(sectorCount, MinSectorCount);
+
+
+
+                BuildVertices(sectorCount, out var vertices, out var indices);
+
+                UpdateTriangles(vertices, indices);
+
+            }
+
+
+
+            public void Render(Vector3 start, Vector3 end, Vector4 color)
+
+            {
+
+                var centralAxis = start - end;
+
+                var length = centralAxis.Length();
+
+                var centerPosition = (start + end) / 2;
+
+                var model = Matrix4x4.CreateScale(baseScale, baseScale, length) * Matrix4x4.CreateWorld(centerPosition, -centralAxis, Vector3.UnitZ);
+
+
+
+                Render(model, color);
+
+            }
+
+
+
+            private void BuildVertices(int sectorCount, out Vertex[] vertices, out int[] indices)
+
+            {
+
+                var radiusInv = 1.0f / baseRadius;
+
+                var sectorStep = (float)(2 * Math.PI / sectorCount);
+
+
+
+                var verticesList = new List<Vertex>();
+
+                for (int circleIndex = 0; circleIndex < 2; ++circleIndex)
+
+                {
+
+                    Vector3 position = new Vector3();
+
+                    position.Z = height / 2 * (1 - 2 * circleIndex);
+
+
+
+                    for (int j = 0; j <= sectorCount; ++j)
+
+                    {
+
+                        var sectorAngle = j * sectorStep;
+
+
+
+                        position.X = (float)(baseRadius * Math.Cos(sectorAngle));
+
+                        position.Y = (float)(baseRadius * Math.Sin(sectorAngle));
+
+
+
+                        Vector3 normal = new Vector3(position.X, position.Y, 0.0f) * radiusInv;
+
+
+
+                        verticesList.Add(new Vertex { Position = position, Normal = normal });
+
+                    }
+
+                }
+
+
+
+                vertices = verticesList.ToArray();
+
+
+
+                var indicesList = new List<int>();
+
+                var k1 = 0;
+
+                var k2 = k1 + sectorCount + 1;
+
+
+
+                for (int j = 0; j < sectorCount; ++j, ++k1, ++k2)
+
+                {
+
+                    indicesList.Add(k1);
+
+                    indicesList.Add(k2);
+
+                    indicesList.Add(k1 + 1);
+
+                    indicesList.Add(k1 + 1);
+
+                    indicesList.Add(k2);
+
+                    indicesList.Add(k2 + 1);
+
+                }
+
+
+
+                indices = indicesList.ToArray();
+
+            }
+
+        }
+
+        public class PointCloudRenderer : VertexRenderer
+
+        {
+
+            private const float pointSize = 3.0f;
+
+
+
+            public void Render(IEnumerable<Vertex> points, Vector4 color)
+
+            {
+
+                UpdateVertices(points.ToArray());
+
+                Render(Matrix4x4.Identity, color);
+
+            }
+
+
+
+            protected override void DrawElements()
+
+            {
+
+                Gl.Enable(EnableCap.DepthTest);
+
+
+
+                // Enable blending
+
+                Gl.Enable(EnableCap.Blend);
+
+                Gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+
+
+
+                Gl.PointSize(pointSize);
+
+
+
+                Gl.BindVertexArray(vertexArrayObject);
+
+                Gl.DrawArrays(PrimitiveType.Points, 0, Vertices.Length);
+
+            }
+
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+
+        public struct Vertex
+
+        {
+
+            public Vector3 Position;
+
+            public Vector3 Normal;
+
+        };
+
+
+
+        public abstract class VertexRenderer
+
+        {
+
+            private readonly uint vertexBufferObject;
+
+            protected readonly uint vertexArrayObject;
+
+
+
+            private uint shaderProgram;
+
+            private int shaderModelIndex;
+
+            private int shaderViewIndex;
+
+            private int shaderProjectionIndex;
+
+            private int shaderColorIndex;
+
+
+
+            internal VertexRenderer()
+
+            {
+
+                View = Matrix4x4.Identity;
+
+                Projection = Matrix4x4.Identity;
+
+
+
+                // Generate vertex buffers.
+
+                vertexArrayObject = Gl.GenVertexArray();
+
+                vertexBufferObject = Gl.GenBuffer();
+
+
+
+                CreateProgram();
+
+            }
+
+
+
+            public Matrix4x4 View { get; set; }
+
+            public Matrix4x4 Projection { get; set; }
+
+
+
+            public Vertex[] Vertices { get; private set; }
+
+
+
+            public void Render(Matrix4x4 model, Vector4 color)
+
+            {
+
+                Gl.UseProgram(shaderProgram);
+
+
+
+                // Set shader variables based on current render parameters.
+
+                Gl.UniformMatrix4f(shaderViewIndex, 1, false, View);
+
+                Gl.UniformMatrix4f(shaderProjectionIndex, 1, false, Projection);
+
+                Gl.Uniform4f(shaderColorIndex, 1, color);
+
+                Gl.UniformMatrix4f(shaderModelIndex, 1, false, model);
+
+
+
+                DrawElements();
+
+            }
+
+
+
+            protected void UpdateVertices(Vertex[] vertices)
+
+            {
+
+                this.Vertices = vertices;
+
+
+
+                var vertexSize = Marshal.SizeOf<Vertex>();
+
+                Gl.BindVertexArray(vertexArrayObject);
+
+                Gl.BindBuffer(BufferTarget.ArrayBuffer, vertexBufferObject);
+
+                Gl.BufferData(BufferTarget.ArrayBuffer, (uint)(vertexSize * vertices.Length), vertices, BufferUsage.StreamDraw);
+
+
+
+                // Set the vertex attribute pointers.
+
+                Gl.EnableVertexAttribArray(0);
+
+                Gl.VertexAttribPointer(0, 3, VertexAttribType.Float, false, vertexSize, IntPtr.Zero);
+
+                Gl.EnableVertexAttribArray(1);
+
+                Gl.VertexAttribPointer(1, 3, VertexAttribType.Float, false, vertexSize, new IntPtr(vertexSize / 2));
+
+            }
+
+
+
+            protected abstract void DrawElements();
+
+
+
+            private void CreateProgram()
+
+            {
+
+                StringBuilder infolog = new StringBuilder(1024);
+
+
+
+                // Vertex shader
+
+                uint vertexShader = Gl.CreateShader(ShaderType.VertexShader);
+
+                Gl.ShaderSource(vertexShader, Shaders.VertexShaderLines);
+
+                Gl.CompileShader(vertexShader);
+
+                Gl.GetShader(vertexShader, ShaderParameterName.CompileStatus, out int compiled);
+
+                if (compiled == 0)
+
+                {
+
+                    Gl.GetShaderInfoLog(vertexShader, infolog.Capacity, out _, infolog);
+
+                    throw new Exception($"Compilation error:\n{infolog.ToString()}");
+
+                }
+
+
+
+                // Fragment shader
+
+                uint fragmentShader = Gl.CreateShader(ShaderType.FragmentShader);
+
+                Gl.ShaderSource(fragmentShader, Shaders.VertexFragmentLines);
+
+                Gl.CompileShader(fragmentShader);
+
+                Gl.GetShader(fragmentShader, ShaderParameterName.CompileStatus, out compiled);
+
+                if (compiled == 0)
+
+                {
+
+                    Gl.GetShaderInfoLog(fragmentShader, infolog.Capacity, out _, infolog);
+
+                    throw new Exception($"Compilation error:\n{infolog.ToString()}");
+
+                }
+
+
+
+                // Program
+
+                shaderProgram = Gl.CreateProgram();
+
+                Gl.AttachShader(shaderProgram, vertexShader);
+
+                Gl.AttachShader(shaderProgram, fragmentShader);
+
+                Gl.LinkProgram(shaderProgram);
+
+
+
+                Gl.GetProgram(shaderProgram, ProgramProperty.LinkStatus, out int linked);
+
+
+
+                if (linked == 0)
+
+                {
+
+                    Gl.GetProgramInfoLog(shaderProgram, infolog.Capacity, out _, infolog);
+
+                    throw new Exception($"Linking error:\n{infolog.ToString()}");
+
+                }
+
+
+
+                shaderModelIndex = Gl.GetUniformLocation(shaderProgram, "model");
+
+                shaderViewIndex = Gl.GetUniformLocation(shaderProgram, "view");
+
+                shaderProjectionIndex = Gl.GetUniformLocation(shaderProgram, "projection");
+
+                shaderColorIndex = Gl.GetUniformLocation(shaderProgram, "color");
+
+            }
+
+        }
+
+        public class TriangleRenderer : VertexRenderer
+
+        {
+
+            private readonly uint elementBufferObject;
+
+            private int[] indices;
+
+
+
+            public TriangleRenderer()
+
+            {
+
+                // Generate OpenGL buffer for storing vertex indices defining face triangles.
+
+                elementBufferObject = Gl.GenBuffer();
+
+            }
+
+
+
+            internal void UpdateTriangles(Vertex[] vertices, int[] indices)
+
+            {
+
+                // Perform sanity check on indices array.
+
+                if ((indices.Length % 3 != 0) ||
+
+                    indices.Any(index => (index < 0) || (index > vertices.Length - 1)))
+
+                {
+
+                    throw new Exception("Array of triangle indices is invalid.");
+
+                }
+
+
+
+                this.indices = indices;
+
+
+
+                UpdateVertices(vertices);
+
+
+
+                Gl.BindVertexArray(vertexArrayObject);
+
+                Gl.BindBuffer(BufferTarget.ElementArrayBuffer, elementBufferObject);
+
+                Gl.BufferData(BufferTarget.ElementArrayBuffer, (uint)(sizeof(int) * indices.Length), indices, BufferUsage.StaticDraw);
+
+            }
+
+
+
+            protected override void DrawElements()
+
+            {
+
+                Gl.BindVertexArray(vertexArrayObject);
+
+                Gl.DrawElements(PrimitiveType.Triangles, indices.Length, DrawElementsType.UnsignedInt, IntPtr.Zero);
+
+            }
+
+        }
+
+        public static class PointCloud
+
+        {
+
+            private static Vector3[,] pointCloudCache;
+
+
+
+            public static void ComputePointCloudCache(Calibration calibration)
+
+            {
+
+                using (var transformation = calibration.CreateTransformation())
+
+                using (var fakeDepth = new Image(ImageFormat.Depth16, calibration.DepthCameraCalibration.ResolutionWidth, calibration.DepthCameraCalibration.ResolutionHeight))
+
+                {
+
+                    // compute 3D points at z = 1000mm distance from the camera.
+
+                    MemoryMarshal.Cast<byte, ushort>(fakeDepth.Memory.Span).Fill(1000);
+
+                    using (var pointCloudImage = transformation.DepthImageToPointCloud(fakeDepth))
+
+                    {
+
+                        var pointCloudBuffer = MemoryMarshal.Cast<byte, short>(pointCloudImage.Memory.Span);
+
+
+
+                        pointCloudCache = new Vector3[calibration.DepthCameraCalibration.ResolutionHeight, calibration.DepthCameraCalibration.ResolutionWidth];
+
+                        for (int k = 0, v = 0; v < calibration.DepthCameraCalibration.ResolutionHeight; ++v)
+
+                        {
+
+                            for (int u = 0; u < calibration.DepthCameraCalibration.ResolutionWidth; ++u, k += 3)
+
+                            {
+
+                                // Divide by 1e6 to store points position per each 1 millimeter of z-distance.
+
+                                var point = new Vector3(pointCloudBuffer[k], pointCloudBuffer[k + 1], pointCloudBuffer[k + 2]) / 1000000;
+
+                                pointCloudCache[v, u] = point;
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+
+
+            public static void ComputePointCloud(Image depth, ref List<Vertex> pointCloud)
+
+            {
+
+                if (pointCloudCache == null)
+
+                {
+
+                    throw new Exception("Must compute the point cloud cache before calling ComputePointCloud.");
+
+                }
+
+
+
+                if (pointCloud == null)
+
+                {
+
+                    pointCloud = new List<Vertex>(depth.HeightPixels * depth.WidthPixels);
+
+                }
+
+
+
+                pointCloud.Clear();
+
+
+
+                var depthPixels = depth.GetPixels<ushort>().ToArray();
+
+
+
+                for (int v = 0, pixelIndex = 0; v < depth.HeightPixels; ++v)
+
+                {
+
+                    for (int u = 0; u < depth.WidthPixels; ++u, ++pixelIndex)
+
+                    {
+
+                        var depthInMillimeters = depthPixels[pixelIndex];
+
+
+
+                        var positionPerMillimeterDepth = pointCloudCache[v, u];
+
+                        if (depthInMillimeters > 0)
+
+                        {
+
+                            pointCloud.Add(new Vertex
+
+                            {
+
+                                Position = positionPerMillimeterDepth * depthInMillimeters,
+
+
+
+                                // Computing normal on the CPU is expensive. Keeping it simple in this sample instead of making another Shader.
+
+                                Normal = Vector3.UnitZ,
+
+                            });
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        }
+
+        static class BodyColors
+
+        {
+
+            private static readonly Color[] colorSet =
+
+            {
+
+            Color.Red,
+
+            Color.Blue,
+
+            Color.Green,
+
+            Color.Yellow,
+
+            Color.DeepSkyBlue,
+
+            Color.HotPink,
+
+            Color.Purple
+
+        };
+
+
+
+            private static Color GetColor(uint i)
+
+            {
+
+                return colorSet[i % colorSet.Length];
+
+            }
+
+
+
+            public static Vector4 GetColorAsVector(uint i)
+
+            {
+
+                var color = GetColor(i);
+
+                return new Vector4(color.R / 255.0f, color.G / 255.0f, color.B / 255.0f, color.A / 255.0f);
+
+            }
+
+        }
+
+        public static class JointConnections
+
+        {
+
+            public static readonly IReadOnlyDictionary<JointId, JointId> JointParent = new Dictionary<JointId, JointId>
+
+        {
+
+            { JointId.SpineNavel, JointId.Pelvis },
+
+            { JointId.SpineChest, JointId.SpineNavel },
+
+            { JointId.Neck, JointId.SpineChest },
+
+            { JointId.ClavicleLeft, JointId.SpineChest },
+
+            { JointId.ShoulderLeft, JointId.ClavicleLeft },
+
+            { JointId.ElbowLeft, JointId.ShoulderLeft },
+
+            { JointId.WristLeft, JointId.ElbowLeft },
+
+            { JointId.HandLeft, JointId.WristLeft },
+
+            { JointId.HandTipLeft, JointId.HandLeft },
+
+            { JointId.ThumbLeft, JointId.WristLeft },
+
+            { JointId.ClavicleRight, JointId.SpineChest },
+
+            { JointId.ShoulderRight, JointId.ClavicleRight },
+
+            { JointId.ElbowRight, JointId.ShoulderRight },
+
+            { JointId.WristRight, JointId.ElbowRight },
+
+            { JointId.HandRight, JointId.WristRight },
+
+            { JointId.HandTipRight, JointId.HandRight },
+
+            { JointId.ThumbRight, JointId.WristRight },
+
+            { JointId.HipLeft, JointId.Pelvis },
+
+            { JointId.KneeLeft, JointId.HipLeft },
+
+            { JointId.AnkleLeft, JointId.KneeLeft },
+
+            { JointId.FootLeft, JointId.AnkleLeft },
+
+            { JointId.HipRight, JointId.Pelvis },
+
+            { JointId.KneeRight, JointId.HipRight },
+
+            { JointId.AnkleRight, JointId.KneeRight },
+
+            { JointId.FootRight, JointId.AnkleRight },
+
+            { JointId.Head, JointId.Neck },
+
+            { JointId.Nose, JointId.Head },
+
+            { JointId.EyeLeft, JointId.Nose },
+
+            { JointId.EarLeft, JointId.EyeLeft },
+
+            { JointId.EyeRight, JointId.Nose },
+
+            { JointId.EarRight, JointId.EyeRight },
+
+        };
+
+        }
+
+        public static class Shaders
+
+        {
+
+            private const string VertexShaderText = @"
+
+            #version 430
+
+            layout(location = 0) in vec3 vertexPosition;
+
+            layout(location = 1) in vec3 vertexNormal;
+
+
+
+            varying vec4 fragmentColor;
+
+            varying vec3 fragmentPosition;
+
+            varying vec3 fragmentNormal;
+
+
+
+            uniform mat4 model;
+
+            uniform mat4 view;
+
+            uniform mat4 projection;
+
+            uniform vec4 color;
+
+
+
+            void main()
+
+            {
+
+                fragmentColor = color;
+
+                fragmentPosition = vec3(model * vec4(vertexPosition, 1.0));
+
+                fragmentNormal = mat3(transpose(inverse(model))) * vertexNormal;
+
+
+
+                gl_Position = projection * view * model * vec4(vertexPosition, 1);
+
+            }
+
+        ";
+
+
+
+            private const string FragmentShaderText = @"
+
+            #version 430
+
+            out vec4 fragColor;
+
+            varying vec4 fragmentColor;
+
+            varying vec3 fragmentPosition;
+
+            varying vec3 fragmentNormal;
+
+
+
+            void main()
+
+            {
+
+                vec3 lightPosition = vec3(0, 0, 0);
+
+
+
+                // diffuse
+
+                vec3 norm = normalize(fragmentNormal);
+
+                vec3 lightDir = lightPosition - fragmentPosition;
+
+                float dist2 = dot(lightDir, lightDir);
+
+                lightDir = normalize(lightDir);
+
+                float diffuse = abs(dot(norm, lightDir)) / dist2;
+
+
+
+                fragColor = vec4(fragmentColor.rgb * diffuse, fragmentColor.a);
+
+            }
+
+        ";
+
+
+
+            public static string[] VertexShaderLines => ConvertToLines(VertexShaderText);
+
+            public static string[] VertexFragmentLines => ConvertToLines(FragmentShaderText);
+
+
+
+            private static string[] ConvertToLines(string text)
+
+            {
+
+                return text.Split('\n').Select(s => s + '\n').ToArray();
+
+            }
+
+        }
+
+    }
+
+}
